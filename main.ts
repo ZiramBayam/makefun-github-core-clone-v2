@@ -65,7 +65,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const url = new URL(req.url ?? '/', 'http://entry.local');
   const pathname = url.pathname;
   const method = (req.method ?? 'GET').toUpperCase();
-  const origin = `${url.protocol}//${url.host}`;
+  // Absolute URLs in REST replies (notably pagination Link headers) must stay on the origin the
+  // suite dialled, which is the Host header rather than the synthetic URL used for path parsing.
+  const forwardedHost = req.headers['x-forwarded-host'];
+  const forwardedProto = req.headers['x-forwarded-proto'];
+  const host = String(Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost ?? req.headers.host ?? url.host).split(',')[0]!.trim();
+  const protocol = String(Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto ?? url.protocol.replace(/:$/, '')).split(',')[0]!.trim();
+  const origin = `${protocol}://${host}`;
   const scopes = 'repo, read:org, write:org';
 
   if (pathname === '/healthz' && method === 'GET') {

@@ -11,8 +11,8 @@ import {
   commitChain,
   parseCommit,
   parseTag,
+  parseTree,
   pktLine,
-  reachable,
   readPack,
   splitPktPrefix,
   writePack,
@@ -157,8 +157,8 @@ function handleLsRefs(repo: RepoRecord, packets: readonly PktLine[]): Buffer {
   const parts: Buffer[] = [];
   const empty = isEmptyRepo(repo);
   if (empty && unborn && keep('HEAD')) {
+    // Git advertises only the unborn HEAD, with its symref target — not a synthetic branch ref.
     parts.push(pktLine(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
-    if (keep(`refs/heads/${repo.defaultBranch}`)) parts.push(pktLine(`unborn refs/heads/${repo.defaultBranch}\n`));
   } else if (!empty) {
     for (const ref of refList(repo)) {
       if (!keep(ref.name)) continue;
@@ -180,11 +180,53 @@ interface Selection {
   shallow: string[];
 }
 
-function selectObjects(repo: RepoRecord, wants: readonly string[], haves: readonly string[], depth: number | undefined): Selection {
+/**
+ * Reachable objects, but traversal stops at the client's shallow boundaries: a boundary itself is
+ * held by the client, everything older than it is not. This is what makes `have third` safe when
+ * deepening a clone that was shallow at `third`.
+ */
+function reachableStopping(
+  roots: Iterable<string>,
+  lookup: (oid: string) => GitObject | undefined,
+  boundaries: ReadonlySet<string>,
+  allowMissing: boolean,
+): Set<string> {
+  const seen = new Set<string>();
+  const queue = [...roots];
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) {
+      if (allowMissing) continue;
+      throw new Error(`missing object ${oid}`);
+    }
+    seen.add(oid);
+    if (boundaries.has(oid)) continue;
+    if (object.type === 'commit') {
+      const commit = parseCommit(object.data);
+      queue.push(commit.tree, ...commit.parents);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) if (entry.mode !== '160000') queue.push(entry.oid);
+    } else if (object.type === 'tag') {
+      queue.push(parseTag(object.data).object);
+    }
+  }
+  return seen;
+}
+
+function selectObjects(
+  repo: RepoRecord,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallowBoundaries: readonly string[],
+  depth: number | undefined,
+): Selection {
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
+  const boundaries = new Set(shallowBoundaries);
   const haveSet = new Set<string>();
   for (const have of haves) {
-    for (const oid of reachable([have], lookup, true)) haveSet.add(oid);
+    for (const oid of reachableStopping([have], lookup, boundaries, true)) haveSet.add(oid);
   }
   const chosen = new Map<string, GitObject>();
   const add = (oid: string): void => {
@@ -195,17 +237,26 @@ function selectObjects(repo: RepoRecord, wants: readonly string[], haves: readon
   const shallow: string[] = [];
   for (const want of wants) {
     if (depth === undefined) {
-      for (const oid of reachable([want], lookup)) add(oid);
+      for (const oid of reachableStopping([want], lookup, boundaries, false)) add(oid);
       continue;
     }
-    const chain = commitChain(want, lookup, depth);
+    // `deepen` deliberately walks past the client's shallow boundary; the boundary only limits
+    // which of the client's `have` objects are assumed to carry their history.
+    const chain: string[] = [];
+    let current = want;
+    while (current && chain.length < Math.max(0, depth)) {
+      const object = lookup(current);
+      if (!object || object.type !== 'commit') break;
+      chain.push(current);
+      current = parseCommit(object.data).parents[0] ?? '';
+    }
     for (let index = 0; index < chain.length; index += 1) {
       const oid = chain[index]!;
       add(oid);
       const object = lookup(oid);
       if (object?.type === 'commit') {
         const commit = parseCommit(object.data);
-        for (const treeOid of reachable([commit.tree], lookup)) add(treeOid);
+        for (const treeOid of reachableStopping([commit.tree], lookup, boundaries, false)) add(treeOid);
         if (index === chain.length - 1 && commit.parents.length > 0) shallow.push(oid);
       }
     }
@@ -238,16 +289,18 @@ function handleFetchV2(repo: RepoRecord, packets: readonly PktLine[]): Buffer {
   }
   const wants: string[] = [];
   const haves: string[] = [];
+  const shallowBoundaries: string[] = [];
   let depth: number | undefined;
   for (const line of lines) {
     if (line.startsWith('want ')) wants.push(line.slice(5).trim());
     else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) shallowBoundaries.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) {
       const parsed = Number.parseInt(line.slice(7).trim(), 10);
       if (Number.isFinite(parsed)) depth = parsed;
     }
   }
-  const selection = selectObjects(repo, wants, haves, depth);
+  const selection = selectObjects(repo, wants, haves, shallowBoundaries, depth);
   const parts: Buffer[] = [pktLine('acknowledgments\n'), ...ackPackets(repo, haves), PKT_FLUSH];
   if (selection.shallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
@@ -270,16 +323,18 @@ function handleFetchV0(repo: RepoRecord, packets: readonly PktLine[]): Buffer {
   }
   const wants: string[] = [];
   const haves: string[] = [];
+  const shallowBoundaries: string[] = [];
   let depth: number | undefined;
   for (const line of lines) {
     if (line.startsWith('want ')) wants.push(line.split(/\s+/)[1] ?? '');
     else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) shallowBoundaries.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) {
       const parsed = Number.parseInt(line.slice(7).trim(), 10);
       if (Number.isFinite(parsed)) depth = parsed;
     }
   }
-  const selection = selectObjects(repo, wants, haves, depth);
+  const selection = selectObjects(repo, wants, haves, shallowBoundaries, depth);
   const parts: Buffer[] = [...ackPackets(repo, haves)];
   for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   parts.push(...packPackets(writePack(selection.objects)));

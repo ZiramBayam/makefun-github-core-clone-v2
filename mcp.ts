@@ -343,9 +343,15 @@ export async function handleMcp(
       }
       const args = isRecord(params.arguments) ? params.arguments : {};
       const answer = callTool(params.name, args);
-      // callTool builds error envelopes with a null id; put the caller's id on them here.
-      if (typeof answer.error === 'object' && answer.error !== null && answer.id === null) answer.id = id;
-      sendJson(res, 200, answer);
+      // A tool result must be carried inside its JSON-RPC response; errors already are envelopes.
+      // callTool builds errors with a null id, so re-issue them under the caller's id.
+      if (isRecord(answer.error)) {
+        const code = typeof answer.error.code === 'number' ? answer.error.code : JSON_RPC_INVALID_PARAMS;
+        const message = typeof answer.error.message === 'string' ? answer.error.message : 'Tool call failed';
+        sendJson(res, 200, rpcError(id, code, message, answer.error.data));
+      } else {
+        sendJson(res, 200, rpcResult(id, answer));
+      }
       return;
     }
     case 'ping':
