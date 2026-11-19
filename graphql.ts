@@ -332,6 +332,16 @@ function executeOne(request: GraphQLRequest): GraphQLResponse {
   return errors.length ? { data, errors } : { data };
 }
 
+/** GraphQL requests are JSON POSTs; any other method carries no operation body. */
+export function isGraphqlBodyRequest(method: string): boolean {
+  return method === 'POST';
+}
+
+/** The GraphQL body is passed through unchanged; the executor accepts objects and operation arrays. */
+export function asGraphqlBody(value: unknown): unknown {
+  return value;
+}
+
 /** Dispatch one `/api/graphql` body. A body array means GitHub-style operation batching. */
 export function handleGraphQL(body: unknown, authorized: boolean): { status: number; body: unknown } {
   if (!authorized) return { status: 401, body: { message: 'Requires authentication' } };
