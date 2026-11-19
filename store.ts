@@ -116,11 +116,14 @@ export function decodeGlobal(id: string): { type: string; key: string } | null {
 
 export class Forge {
   readonly repos = new Map<string, RepoRecord>();
+  readonly seed: Scenario;
   private nextRepoId = 5000;
   private nextObjectId = 100000;
   private commitCounter = 0;
 
-  constructor(readonly seed: Scenario = scenario) {}
+  constructor(seed: Scenario = scenario) {
+    this.seed = seed;
+  }
 
   key(owner: string, name: string): string {
     return `${owner}/${name}`;
